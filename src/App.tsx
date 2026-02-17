@@ -53,6 +53,8 @@ function App() {
       setOverlayVisible(false)
     } else {
       await invoke('create_overlay', { width: 320.0, height: 500.0 })
+      // Set the Groq API key for the overlay chat
+      await invoke('set_groq_api_key', { key: GROQ_API_KEY })
       setOverlayVisible(true)
     }
   }

@@ -48,6 +48,8 @@ static SPEECH_BUBBLE: Mutex<Option<SafeId>> = Mutex::new(None);
 
 // Chat UI elements
 #[cfg(target_os = "macos")]
+static CHAT_PANEL: Mutex<Option<SafeId>> = Mutex::new(None); // Separate centered panel for chat
+#[cfg(target_os = "macos")]
 static CHAT_CONTAINER: Mutex<Option<SafeId>> = Mutex::new(None);
 #[cfg(target_os = "macos")]
 static CHAT_INPUT: Mutex<Option<SafeId>> = Mutex::new(None);
@@ -61,6 +63,14 @@ static THINKING_LABEL: Mutex<Option<SafeId>> = Mutex::new(None);
 // Chat state: 0=Idle, 1=InputOpen, 2=Thinking, 3=Responding
 #[cfg(target_os = "macos")]
 static CHAT_STATE: AtomicUsize = AtomicUsize::new(0);
+
+// Last click timestamp for debouncing (in milliseconds)
+#[cfg(target_os = "macos")]
+static LAST_CLICK_TIME: AtomicUsize = AtomicUsize::new(0);
+
+// Track if hand cursor is currently shown (for global mouse move handler)
+#[cfg(target_os = "macos")]
+static CURSOR_IS_HAND: AtomicBool = AtomicBool::new(false);
 
 // Store current response text for typing effect
 #[cfg(target_os = "macos")]
@@ -222,9 +232,88 @@ fn get_or_create_key_panel_class() -> &'static Class {
     Class::get("KeyablePanel").unwrap()
 }
 
+/// Creates a custom NSView subclass that changes cursor on mouse enter/exit
+#[cfg(target_os = "macos")]
+/// Create a custom NSImageView subclass with hand cursor on hover
+fn get_or_create_cursor_image_view_class() -> &'static Class {
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+
+    REGISTER.call_once(|| {
+        let superclass = Class::get("NSImageView").unwrap();
+        let mut decl = ClassDecl::new("CursorImageView", superclass).unwrap();
+
+        // Override mouseEntered to show hand cursor
+        extern "C" fn mouse_entered(_this: &Object, _sel: Sel, _event: id) {
+            unsafe {
+                let hand_cursor: id = msg_send![Class::get("NSCursor").unwrap(), pointingHandCursor];
+                let _: () = msg_send![hand_cursor, push];
+            }
+        }
+
+        // Override mouseExited to restore arrow cursor
+        extern "C" fn mouse_exited(_this: &Object, _sel: Sel, _event: id) {
+            unsafe {
+                let _: () = msg_send![Class::get("NSCursor").unwrap(), pop];
+            }
+        }
+
+        // Override updateTrackingAreas to add tracking area on view setup
+        extern "C" fn update_tracking_areas(this: &Object, _sel: Sel) {
+            unsafe {
+                // Call super
+                let superclass = Class::get("NSImageView").unwrap();
+                let _: () = msg_send![super(this, superclass), updateTrackingAreas];
+
+                // Remove old tracking areas
+                let tracking_areas: id = msg_send![this, trackingAreas];
+                let count: usize = msg_send![tracking_areas, count];
+                for i in 0..count {
+                    let area: id = msg_send![tracking_areas, objectAtIndex: i];
+                    let _: () = msg_send![this, removeTrackingArea: area];
+                }
+
+                // Add new tracking area
+                let bounds: NSRect = msg_send![this, bounds];
+                // NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                let options: u64 = 0x01 | 0x80 | 0x200;
+                let tracking_area: id = msg_send![Class::get("NSTrackingArea").unwrap(), alloc];
+                let tracking_area: id = msg_send![tracking_area,
+                    initWithRect: bounds
+                    options: options
+                    owner: this
+                    userInfo: nil
+                ];
+                let _: () = msg_send![this, addTrackingArea: tracking_area];
+            }
+        }
+
+        unsafe {
+            decl.add_method(
+                sel!(mouseEntered:),
+                mouse_entered as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(mouseExited:),
+                mouse_exited as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(updateTrackingAreas),
+                update_tracking_areas as extern "C" fn(&Object, Sel),
+            );
+        }
+
+        decl.register();
+    });
+
+    Class::get("CursorImageView").unwrap()
+}
+
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
 pub fn create_overlay(width: f64, height: f64) {
+    eprintln!("[DEBUG] create_overlay called with width={}, height={}", width, height);
+    log::info!("create_overlay called with width={}, height={}", width, height);
+
     // Store dimensions for later use
     {
         let mut w = OVERLAY_WIDTH.lock().unwrap();
@@ -417,7 +506,9 @@ pub fn create_overlay(width: f64, height: f64) {
             NSSize::new(img_width, img_height),
         );
 
-        let image_view: id = msg_send![Class::get("NSImageView").unwrap(), alloc];
+        // Use custom CursorImageView class for hand cursor on hover
+        let cursor_image_class = get_or_create_cursor_image_view_class();
+        let image_view: id = msg_send![cursor_image_class, alloc];
         let image_view: id = msg_send![image_view, initWithFrame: img_frame];
         // Use NSImageScaleNone (0) - images are pre-scaled with high quality
         let _: () = msg_send![image_view, setImageScaling: 0_i64];
@@ -431,6 +522,9 @@ pub fn create_overlay(width: f64, height: f64) {
         }
 
         let _: () = msg_send![container_view, addSubview: image_view];
+
+        // Trigger tracking area setup
+        let _: () = msg_send![image_view, updateTrackingAreas];
 
         // Store image view reference for animation
         {
@@ -487,11 +581,23 @@ pub fn create_overlay(width: f64, height: f64) {
         }
 
         // ========== CHAT UI CREATION ==========
-        // Chat container box - positioned above the cat (more square proportions)
-        let chat_box_width = 220.0;
-        let chat_box_height = 50.0;
+        // Get screen dimensions for center positioning
+        let screen: id = msg_send![Class::get("NSScreen").unwrap(), mainScreen];
+        let screen_frame: NSRect = msg_send![screen, frame];
+        let screen_center_x = screen_frame.size.width / 2.0;
+        let screen_center_y = screen_frame.size.height / 2.0;
+
+        // Chat box - sleek modern design positioned at CENTER OF SCREEN
+        let chat_box_width = 320.0;
+        let chat_box_height = 56.0;
+        // Position in screen coordinates (will be converted when showing)
+        // Store these for later use
+        let _screen_chat_x = screen_center_x - chat_box_width / 2.0;
+        let _screen_chat_y = screen_center_y - chat_box_height / 2.0;
+
+        // For now, position relative to panel (will reposition when showing)
         let chat_box_x = (width - chat_box_width) / 2.0;
-        let chat_box_y = img_y + img_height + 12.0; // Above the cat
+        let chat_box_y = img_y + img_height + 20.0;
         let chat_frame = NSRect::new(
             NSPoint::new(chat_box_x, chat_box_y),
             NSSize::new(chat_box_width, chat_box_height),
@@ -502,34 +608,36 @@ pub fn create_overlay(width: f64, height: f64) {
         let chat_container: id = msg_send![chat_container, initWithFrame: chat_frame];
         let _: () = msg_send![chat_container, setWantsLayer: YES];
 
-        // Style the container with sleek design
+        // Style: WHITE background with BLACK text, sleek curved border
         let chat_layer: id = msg_send![chat_container, layer];
-        let _: () = msg_send![chat_layer, setCornerRadius: 12.0_f64];
-        let _: () = msg_send![chat_layer, setMasksToBounds: NO]; // Allow shadow to show
+        let _: () = msg_send![chat_layer, setCornerRadius: 28.0_f64]; // Pill shape
+        let _: () = msg_send![chat_layer, setMasksToBounds: NO];
 
-        // Background color #f0b26c
-        let bg_color = create_color(240.0, 178.0, 108.0, 1.0);
-        let cg_bg_color: id = msg_send![bg_color, CGColor];
-        let _: () = msg_send![chat_layer, setBackgroundColor: cg_bg_color];
+        // White background
+        let white: id = msg_send![Class::get("NSColor").unwrap(), whiteColor];
+        let cg_white: id = msg_send![white, CGColor];
+        let _: () = msg_send![chat_layer, setBackgroundColor: cg_white];
 
-        // Border color #e37f0e (slightly thinner for sleeker look)
-        let border_color = create_color(227.0, 127.0, 14.0, 1.0);
+        // Subtle gray border for sleek look
+        let border_color = create_color(220.0, 220.0, 220.0, 1.0);
         let cg_border_color: id = msg_send![border_color, CGColor];
         let _: () = msg_send![chat_layer, setBorderColor: cg_border_color];
-        let _: () = msg_send![chat_layer, setBorderWidth: 2.0_f64];
+        let _: () = msg_send![chat_layer, setBorderWidth: 1.0_f64];
 
-        // Add subtle shadow for depth
-        let _: () = msg_send![chat_layer, setShadowOpacity: 0.25_f32];
-        let _: () = msg_send![chat_layer, setShadowRadius: 8.0_f64];
-        let _: () = msg_send![chat_layer, setShadowOffset: NSSize::new(0.0, -3.0)];
+        // Elegant shadow for depth
+        let _: () = msg_send![chat_layer, setShadowOpacity: 0.15_f32];
+        let _: () = msg_send![chat_layer, setShadowRadius: 20.0_f64];
+        let _: () = msg_send![chat_layer, setShadowOffset: NSSize::new(0.0, -5.0)];
         let black: id = msg_send![Class::get("NSColor").unwrap(), blackColor];
         let cg_black: id = msg_send![black, CGColor];
         let _: () = msg_send![chat_layer, setShadowColor: cg_black];
 
-        // Create text input field
-        let input_width = chat_box_width - 56.0; // Leave space for send button
-        let input_height = 34.0;
-        let input_x = 12.0;
+        // Create text input field (sleek inline style)
+        let input_padding = 20.0;
+        let btn_space = 50.0;
+        let input_width = chat_box_width - input_padding * 2.0 - btn_space;
+        let input_height = 30.0;
+        let input_x = input_padding;
         let input_y = (chat_box_height - input_height) / 2.0;
         let input_frame = NSRect::new(
             NSPoint::new(input_x, input_y),
@@ -543,27 +651,42 @@ pub fn create_overlay(width: f64, height: f64) {
         let _: () = msg_send![chat_input, setBordered: NO];
         let _: () = msg_send![chat_input, setDrawsBackground: NO];
         let _: () = msg_send![chat_input, setWantsLayer: YES];
-        let _: () = msg_send![chat_input, setFocusRingType: 0_i64]; // NSFocusRingTypeNone
+        let _: () = msg_send![chat_input, setFocusRingType: 0_i64];
         let _: () = msg_send![chat_input, setAllowsEditingTextAttributes: NO];
 
-        // Set text color #3e2723
-        let input_text_color = create_color(62.0, 39.0, 35.0, 1.0);
-        let _: () = msg_send![chat_input, setTextColor: input_text_color];
+        // BLACK text color
+        let black_text: id = msg_send![Class::get("NSColor").unwrap(), blackColor];
+        let _: () = msg_send![chat_input, setTextColor: black_text];
 
-        // Set placeholder with darker color #6d4c41 (darker brown)
-        let placeholder_str = NSString::alloc(nil).init_str("How can I help today?");
-        let _: () = msg_send![chat_input, setPlaceholderString: placeholder_str];
+        // Set placeholder with gray color
+        let placeholder_str = NSString::alloc(nil).init_str("Ask me anything...");
+        let placeholder_color = create_color(150.0, 150.0, 150.0, 1.0);
+        let placeholder_font: id = msg_send![Class::get("NSFont").unwrap(), systemFontOfSize: 15.0_f64 weight: 0.0_f64];
 
-        // Set font for input (smaller for sleeker look)
-        let input_font = load_chicle_font(16.0);
+        let foreground_color_key = NSString::alloc(nil).init_str("NSColor");
+        let font_key = NSString::alloc(nil).init_str("NSFont");
+
+        let keys: [id; 2] = [foreground_color_key, font_key];
+        let objects: [id; 2] = [placeholder_color, placeholder_font];
+        let placeholder_dict: id = msg_send![Class::get("NSDictionary").unwrap(),
+            dictionaryWithObjects: objects.as_ptr()
+            forKeys: keys.as_ptr()
+            count: 2_usize
+        ];
+        let attributed_placeholder: id = msg_send![Class::get("NSAttributedString").unwrap(), alloc];
+        let attributed_placeholder: id = msg_send![attributed_placeholder, initWithString:placeholder_str attributes:placeholder_dict];
+        let _: () = msg_send![chat_input, setPlaceholderAttributedString: attributed_placeholder];
+
+        // Modern system font for input
+        let input_font: id = msg_send![Class::get("NSFont").unwrap(), systemFontOfSize: 15.0_f64 weight: 0.0_f64];
         let _: () = msg_send![chat_input, setFont: input_font];
 
         let _: () = msg_send![chat_container, addSubview: chat_input];
 
-        // Create send button (bigger for easier clicking)
-        let btn_width = 36.0;
-        let btn_height = 36.0;
-        let btn_x = chat_box_width - btn_width - 7.0;
+        // Create send button (pill-shaped on right side)
+        let btn_width = 40.0;
+        let btn_height = 40.0;
+        let btn_x = chat_box_width - btn_width - 8.0;
         let btn_y = (chat_box_height - btn_height) / 2.0;
         let btn_frame = NSRect::new(
             NSPoint::new(btn_x, btn_y),
@@ -574,24 +697,34 @@ pub fn create_overlay(width: f64, height: f64) {
         let send_btn: id = msg_send![send_btn, initWithFrame: btn_frame];
         let _: () = msg_send![send_btn, setWantsLayer: YES];
         let _: () = msg_send![send_btn, setBordered: NO];
-        let _: () = msg_send![send_btn, setTitle: NSString::alloc(nil).init_str("➤")];
+        let _: () = msg_send![send_btn, setTitle: NSString::alloc(nil).init_str("↑")];
 
-        // Set larger font for send icon
-        let send_font: id = msg_send![Class::get("NSFont").unwrap(), systemFontOfSize: 18.0_f64];
+        // Set font for send icon (bold arrow)
+        let send_font: id = msg_send![Class::get("NSFont").unwrap(), boldSystemFontOfSize: 18.0_f64];
         let _: () = msg_send![send_btn, setFont: send_font];
 
-        // Style button with sleeker design
+        // Sleek black circular button
         let btn_layer: id = msg_send![send_btn, layer];
-        let _: () = msg_send![btn_layer, setCornerRadius: 18.0_f64];
-        // Creamy brown send button #c9956a (slightly darker for contrast)
-        let btn_bg = create_color(201.0, 149.0, 106.0, 1.0);
-        let cg_btn_bg: id = msg_send![btn_bg, CGColor];
-        let _: () = msg_send![btn_layer, setBackgroundColor: cg_btn_bg];
+        let _: () = msg_send![btn_layer, setCornerRadius: 20.0_f64];
+        let black_bg: id = msg_send![Class::get("NSColor").unwrap(), blackColor];
+        let cg_black_bg: id = msg_send![black_bg, CGColor];
+        let _: () = msg_send![btn_layer, setBackgroundColor: cg_black_bg];
 
-        // Add subtle inner shadow effect on button
-        let _: () = msg_send![btn_layer, setShadowOpacity: 0.2_f32];
-        let _: () = msg_send![btn_layer, setShadowRadius: 2.0_f64];
-        let _: () = msg_send![btn_layer, setShadowOffset: NSSize::new(0.0, -1.0)];
+        // White text on black button
+        let white_text: id = msg_send![Class::get("NSColor").unwrap(), whiteColor];
+        // Use attributed string for button title
+        let btn_title = NSString::alloc(nil).init_str("↑");
+        let btn_font: id = msg_send![Class::get("NSFont").unwrap(), boldSystemFontOfSize: 18.0_f64];
+        let btn_keys: [id; 2] = [foreground_color_key, font_key];
+        let btn_objects: [id; 2] = [white_text, btn_font];
+        let btn_dict: id = msg_send![Class::get("NSDictionary").unwrap(),
+            dictionaryWithObjects: btn_objects.as_ptr()
+            forKeys: btn_keys.as_ptr()
+            count: 2_usize
+        ];
+        let btn_attr_title: id = msg_send![Class::get("NSAttributedString").unwrap(), alloc];
+        let btn_attr_title: id = msg_send![btn_attr_title, initWithString:btn_title attributes:btn_dict];
+        let _: () = msg_send![send_btn, setAttributedTitle: btn_attr_title];
 
         let _: () = msg_send![chat_container, addSubview: send_btn];
 
@@ -680,18 +813,33 @@ pub fn create_overlay(width: f64, height: f64) {
         let _: () = msg_send![response_box, setDrawsBackground: YES];
         let _: () = msg_send![response_box, setWantsLayer: YES];
 
-        // Style response box
+        // Style response box - white background with black text
         let response_layer: id = msg_send![response_box, layer];
-        let _: () = msg_send![response_layer, setCornerRadius: 15.0_f64];
-        let _: () = msg_send![response_layer, setMasksToBounds: YES];
-        let _: () = msg_send![response_box, setBackgroundColor: bg_color];
-        let cg_resp_bg: id = msg_send![bg_color, CGColor];
-        let _: () = msg_send![response_layer, setBackgroundColor: cg_resp_bg];
-        let _: () = msg_send![response_layer, setBorderColor: cg_border_color];
-        let _: () = msg_send![response_layer, setBorderWidth: 3.0_f64];
+        let _: () = msg_send![response_layer, setCornerRadius: 20.0_f64];
+        let _: () = msg_send![response_layer, setMasksToBounds: NO];
 
-        let _: () = msg_send![response_box, setTextColor: input_text_color];
-        let response_font = load_chicle_font(20.0);
+        let white: id = msg_send![Class::get("NSColor").unwrap(), whiteColor];
+        let _: () = msg_send![response_box, setBackgroundColor: white];
+        let cg_white: id = msg_send![white, CGColor];
+        let _: () = msg_send![response_layer, setBackgroundColor: cg_white];
+
+        // Subtle border
+        let resp_border_color = create_color(230.0, 230.0, 230.0, 1.0);
+        let cg_resp_border: id = msg_send![resp_border_color, CGColor];
+        let _: () = msg_send![response_layer, setBorderColor: cg_resp_border];
+        let _: () = msg_send![response_layer, setBorderWidth: 1.0_f64];
+
+        // Shadow
+        let _: () = msg_send![response_layer, setShadowOpacity: 0.15_f32];
+        let _: () = msg_send![response_layer, setShadowRadius: 15.0_f64];
+        let _: () = msg_send![response_layer, setShadowOffset: NSSize::new(0.0, -5.0)];
+        let black_shadow: id = msg_send![Class::get("NSColor").unwrap(), blackColor];
+        let cg_black_shadow: id = msg_send![black_shadow, CGColor];
+        let _: () = msg_send![response_layer, setShadowColor: cg_black_shadow];
+
+        let black_text: id = msg_send![Class::get("NSColor").unwrap(), blackColor];
+        let _: () = msg_send![response_box, setTextColor: black_text];
+        let response_font: id = msg_send![Class::get("NSFont").unwrap(), systemFontOfSize: 15.0_f64 weight: 0.0_f64];
         let _: () = msg_send![response_box, setFont: response_font];
         let _: () = msg_send![response_box, setAlignment: 0_i64]; // Left align
 
@@ -1002,15 +1150,79 @@ pub fn hide_speech_bubble() {
     }
 }
 
+/// Handle mouse move for hover cursor effect
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn handle_mouse_move() {
+    unsafe {
+        let screen_loc: NSPoint = msg_send![Class::get("NSEvent").unwrap(), mouseLocation];
+
+        // Check if mouse is over the cat using screen coordinates directly
+        let is_over_cat = {
+            let panel_guard = OVERLAY_PANEL.lock().unwrap();
+            if let Some(ref panel) = *panel_guard {
+                let panel_frame: NSRect = msg_send![panel.0, frame];
+
+                // Cat is 320x320 centered at bottom of panel
+                // Calculate cat bounds in screen coordinates
+                let cat_width = 320.0;
+                let cat_height = 320.0;
+                let cat_screen_x = panel_frame.origin.x + (panel_frame.size.width - cat_width) / 2.0;
+                let cat_screen_y = panel_frame.origin.y; // Cat is at bottom of panel
+
+                // Check if mouse is within cat bounds (screen coordinates)
+                screen_loc.x >= cat_screen_x
+                    && screen_loc.x <= cat_screen_x + cat_width
+                    && screen_loc.y >= cat_screen_y
+                    && screen_loc.y <= cat_screen_y + cat_height
+            } else {
+                false
+            }
+        };
+
+        let currently_hand = CURSOR_IS_HAND.load(Ordering::SeqCst);
+
+        if is_over_cat && !currently_hand {
+            // Show hand cursor
+            let hand_cursor: id = msg_send![Class::get("NSCursor").unwrap(), pointingHandCursor];
+            let _: () = msg_send![hand_cursor, set];
+            CURSOR_IS_HAND.store(true, Ordering::SeqCst);
+        } else if !is_over_cat && currently_hand {
+            // Restore arrow cursor
+            let arrow_cursor: id = msg_send![Class::get("NSCursor").unwrap(), arrowCursor];
+            let _: () = msg_send![arrow_cursor, set];
+            CURSOR_IS_HAND.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Handle click at screen location
 #[cfg(target_os = "macos")]
 fn handle_click_at_location(screen_loc: NSPoint) {
+    // Debounce: ignore clicks within 800ms of the last click
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as usize;
+    let last_click = LAST_CLICK_TIME.load(Ordering::SeqCst);
+    let time_since_last = if now > last_click { now - last_click } else { 0 };
+
+    // Check if this is a duplicate event (within 800ms)
+    if time_since_last < 800 && last_click > 0 {
+        eprintln!("[DEBUG] Debouncing click ({}ms since last)", time_since_last);
+        log::info!("Debouncing click ({}ms since last)", time_since_last);
+        return;
+    }
+
+    // Store the current time AFTER checking to ensure first click goes through
+    LAST_CLICK_TIME.store(now, Ordering::SeqCst);
+
     let state = CHAT_STATE.load(Ordering::SeqCst);
 
     eprintln!("[DEBUG] Click detected at ({}, {}), state={}", screen_loc.x, screen_loc.y, state);
     log::info!("Click detected at ({}, {}), state={}", screen_loc.x, screen_loc.y, state);
 
-    // Calculate click targets - get panel info and release lock immediately
+    // Calculate click targets using screen coordinates directly
     eprintln!("[DEBUG] Acquiring OVERLAY_PANEL lock in handle_click");
     let (is_on_cat, is_on_send_btn) = {
         let panel_guard = OVERLAY_PANEL.lock().unwrap();
@@ -1026,33 +1238,34 @@ fn handle_click_at_location(screen_loc: NSPoint) {
                     panel_frame.origin.x, panel_frame.origin.y,
                     panel_frame.size.width, panel_frame.size.height);
 
-                // Cat is at the bottom of the panel (y=0 in local coordinates), 320x320
+                // Use screen coordinates directly (more reliable than convertPointFromScreen)
                 let cat_width = 320.0;
                 let cat_height = 320.0;
-                let cat_x = panel_frame.origin.x + (panel_frame.size.width - cat_width) / 2.0;
-                let cat_y = panel_frame.origin.y; // Cat is at the bottom
+                // Cat position in screen coordinates
+                let cat_screen_x = panel_frame.origin.x + (panel_frame.size.width - cat_width) / 2.0;
+                let cat_screen_y = panel_frame.origin.y; // Cat is at bottom of panel
 
-                eprintln!("[DEBUG] Cat bounds: x={}-{}, y={}-{}", cat_x, cat_x + cat_width, cat_y, cat_y + cat_height);
-                log::info!("Cat bounds: x={}-{}, y={}-{}", cat_x, cat_x + cat_width, cat_y, cat_y + cat_height);
+                eprintln!("[DEBUG] Click at screen: ({}, {})", screen_loc.x, screen_loc.y);
+                eprintln!("[DEBUG] Cat screen bounds: x={}-{}, y={}-{}",
+                    cat_screen_x, cat_screen_x + cat_width, cat_screen_y, cat_screen_y + cat_height);
+                log::info!("Click at screen: ({}, {})", screen_loc.x, screen_loc.y);
+                log::info!("Cat screen bounds: x={}-{}, y={}-{}",
+                    cat_screen_x, cat_screen_x + cat_width, cat_screen_y, cat_screen_y + cat_height);
 
-                let is_on_cat = screen_loc.x >= cat_x
-                    && screen_loc.x <= cat_x + cat_width
-                    && screen_loc.y >= cat_y
-                    && screen_loc.y <= cat_y + cat_height;
+                let c1 = screen_loc.x >= cat_screen_x;
+                let c2 = screen_loc.x <= cat_screen_x + cat_width;
+                let c3 = screen_loc.y >= cat_screen_y;
+                let c4 = screen_loc.y <= cat_screen_y + cat_height;
+                eprintln!("[DEBUG] Cat check: x>={}: {}, x<={}: {}, y>={}: {}, y<={}: {}",
+                    cat_screen_x, c1, cat_screen_x + cat_width, c2, cat_screen_y, c3, cat_screen_y + cat_height, c4);
+                log::info!("Cat check: x>={}: {}, x<={}: {}, y>={}: {}, y<={}: {}",
+                    cat_screen_x, c1, cat_screen_x + cat_width, c2, cat_screen_y, c3, cat_screen_y + cat_height, c4);
+                let is_on_cat = c1 && c2 && c3 && c4;
 
-                // Check if click is on send button (updated dimensions)
-                let chat_box_width = 220.0;
-                let chat_box_height = 50.0;
-                let chat_box_x = panel_frame.origin.x + (panel_frame.size.width - chat_box_width) / 2.0;
-                let chat_box_y = panel_frame.origin.y + cat_height + 12.0; // Above the cat
-                let btn_width = 36.0;
-                let btn_height = 36.0;
-                let btn_x = chat_box_x + chat_box_width - btn_width - 7.0;
-                let btn_y = chat_box_y + (chat_box_height - btn_height) / 2.0;
-
-                let is_on_send_btn = state == 1
-                    && screen_loc.x >= btn_x && screen_loc.x <= btn_x + btn_width
-                    && screen_loc.y >= btn_y && screen_loc.y <= btn_y + btn_height;
+                // Check if click is on send button - button is NOT on overlay panel anymore
+                // The chat panel is separate, so this check is not valid here
+                // We'll handle send button clicks through the chat panel
+                let is_on_send_btn = false;
 
                 (is_on_cat, is_on_send_btn)
             }
@@ -1073,6 +1286,9 @@ fn handle_click_at_location(screen_loc: NSPoint) {
         log::info!("Submitting chat input");
         submit_chat_input();
     } else if is_on_cat {
+        // Always animate click feedback on cat
+        animate_cat_click_feedback();
+
         match state {
             0 => {
                 eprintln!("[DEBUG] Opening chat input");
@@ -1101,60 +1317,77 @@ fn handle_click_at_location(screen_loc: NSPoint) {
 pub fn start_click_monitor() {
     if CLICK_MONITOR_RUNNING.swap(true, Ordering::SeqCst) {
         log::info!("Click monitor already running");
+        eprintln!("[DEBUG] Click monitor already running");
         return;
     }
 
     log::info!("Starting click monitor");
+    eprintln!("[DEBUG] Starting click monitor");
 
     std::thread::spawn(|| {
         use block::ConcreteBlock;
 
         unsafe {
-            // Add BOTH global and local event monitors for left mouse down
-            // Global monitors events in OTHER apps, local monitors in THIS app
-            let mouse_mask: u64 = 1 << 1; // NSEventMaskLeftMouseDown
+            eprintln!("[DEBUG] Inside click monitor thread");
 
-            // Global monitor (for clicks when other apps are focused)
-            let global_handler = ConcreteBlock::new(move |event: id| -> id {
+            // NSEventMaskLeftMouseDown = 1 << 1
+            let mouse_mask: u64 = 1 << 1;
+
+            // Global monitor - catches clicks when OTHER apps are focused
+            let global_handler = ConcreteBlock::new(move |_event: id| {
+                eprintln!("[DEBUG] GLOBAL click detected!");
                 let screen_loc: NSPoint = msg_send![Class::get("NSEvent").unwrap(), mouseLocation];
                 handle_click_at_location(screen_loc);
-                event
             });
             let global_handler = global_handler.copy();
 
-            let _: id = msg_send![Class::get("NSEvent").unwrap(),
+            let global_monitor: id = msg_send![Class::get("NSEvent").unwrap(),
                 addGlobalMonitorForEventsMatchingMask: mouse_mask
                 handler: &*global_handler
             ];
-            log::info!("Global mouse monitor registered");
+            eprintln!("[DEBUG] Global mouse monitor: {:?}", global_monitor);
+            log::info!("Global mouse monitor registered: {:?}", global_monitor);
 
-            // Local monitor (for clicks in this app - won't work if panel ignores mouse events)
-            let local_handler = ConcreteBlock::new(move |event: id| -> id {
-                let screen_loc: NSPoint = msg_send![Class::get("NSEvent").unwrap(), mouseLocation];
-                handle_click_at_location(screen_loc);
-                event
+            // NOTE: Local monitor removed - global monitor should catch all clicks
+            // Local monitors cause double-click issues when both are registered
+
+            // Add mouse move monitor for hover cursor effect (both global and local)
+            let move_mask: u64 = 1 << 5; // NSEventMaskMouseMoved
+            let move_handler = ConcreteBlock::new(move |_event: id| {
+                handle_mouse_move();
             });
-            let local_handler = local_handler.copy();
+            let move_handler = move_handler.copy();
 
             let _: id = msg_send![Class::get("NSEvent").unwrap(),
-                addLocalMonitorForEventsMatchingMask: mouse_mask
-                handler: &*local_handler
+                addGlobalMonitorForEventsMatchingMask: move_mask
+                handler: &*move_handler
             ];
-            log::info!("Local mouse monitor registered");
+
+            let move_handler_local = ConcreteBlock::new(move |event: id| -> id {
+                handle_mouse_move();
+                event
+            });
+            let move_handler_local = move_handler_local.copy();
+
+            let _: id = msg_send![Class::get("NSEvent").unwrap(),
+                addLocalMonitorForEventsMatchingMask: move_mask
+                handler: &*move_handler_local
+            ];
+            log::info!("Mouse move monitors registered for hover cursor");
+            eprintln!("[DEBUG] Mouse move monitors registered");
 
             // Add key event monitors for Enter key
             let key_mask: u64 = 1 << 10; // NSEventMaskKeyDown
 
-            let global_key_handler = ConcreteBlock::new(move |event: id| -> id {
+            let global_key_handler = ConcreteBlock::new(move |_event: id| {
                 let state = CHAT_STATE.load(Ordering::SeqCst);
                 if state == 1 {
-                    let key_code: u16 = msg_send![event, keyCode];
+                    let key_code: u16 = msg_send![_event, keyCode];
                     if key_code == 36 || key_code == 76 {
                         log::info!("Enter key pressed (global)");
                         submit_chat_input();
                     }
                 }
-                event
             });
             let global_key_handler = global_key_handler.copy();
 
@@ -1181,18 +1414,21 @@ pub fn start_click_monitor() {
                 handler: &*local_key_handler
             ];
             log::info!("Key monitors registered");
+            eprintln!("[DEBUG] Key monitors registered");
+            eprintln!("[DEBUG] Click monitor setup complete, entering run loop");
 
-            // Keep the thread alive
-            let run_loop: id = msg_send![Class::get("NSRunLoop").unwrap(), currentRunLoop];
-            while CLICK_MONITOR_RUNNING.load(Ordering::SeqCst) {
-                let date: id = msg_send![Class::get("NSDate").unwrap(), dateWithTimeIntervalSinceNow: 0.1_f64];
-                let _: bool = msg_send![run_loop,
-                    runMode: NSString::alloc(nil).init_str("kCFRunLoopDefaultMode")
-                    beforeDate: date
-                ];
+            // Keep the thread alive with proper run loop
+            loop {
+                if !CLICK_MONITOR_RUNNING.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
+            eprintln!("[DEBUG] Click monitor thread exiting");
         }
     });
+
+    eprintln!("[DEBUG] Click monitor spawned");
 }
 
 /// Stop click monitor
@@ -1201,83 +1437,277 @@ pub fn stop_click_monitor() {
     CLICK_MONITOR_RUNNING.store(false, Ordering::SeqCst);
 }
 
-/// Show chat input box with fade in
+/// Animate click feedback on the cat image (scale bounce effect)
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn animate_cat_click_feedback() {
+    unsafe {
+        let guard = IMAGE_VIEW.lock().unwrap();
+        if let Some(ref img_view) = *guard {
+            // Quick scale-down then scale-up animation for click feedback
+            // Use NSAnimationContext with completion handler
+            let _: () = msg_send![Class::get("NSAnimationContext").unwrap(), beginGrouping];
+            let context: id = msg_send![Class::get("NSAnimationContext").unwrap(), currentContext];
+            let _: () = msg_send![context, setDuration: 0.08_f64];
+
+            // Get the layer for transform
+            let layer: id = msg_send![img_view.0, layer];
+            if layer != nil {
+                // Create CABasicAnimation for transform.scale
+                let animation: id = msg_send![Class::get("CABasicAnimation").unwrap(),
+                    animationWithKeyPath: NSString::alloc(nil).init_str("transform.scale")];
+                let _: () = msg_send![animation, setFromValue: {
+                    let num: id = msg_send![Class::get("NSNumber").unwrap(), numberWithFloat: 1.0_f32];
+                    num
+                }];
+                let _: () = msg_send![animation, setToValue: {
+                    let num: id = msg_send![Class::get("NSNumber").unwrap(), numberWithFloat: 0.92_f32];
+                    num
+                }];
+                let _: () = msg_send![animation, setDuration: 0.08_f64];
+                let _: () = msg_send![animation, setAutoreverses: YES];
+                let _: () = msg_send![animation, setTimingFunction: {
+                    let timing: id = msg_send![Class::get("CAMediaTimingFunction").unwrap(),
+                        functionWithName: NSString::alloc(nil).init_str("easeInEaseOut")];
+                    timing
+                }];
+                let _: () = msg_send![layer, addAnimation: animation forKey: NSString::alloc(nil).init_str("clickBounce")];
+            }
+
+            let _: () = msg_send![Class::get("NSAnimationContext").unwrap(), endGrouping];
+        }
+    }
+}
+
+/// Show chat input box with fade in animation - CENTERED ON SCREEN
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
 pub fn show_chat_input() {
-    eprintln!("[DEBUG] show_chat_input called");
     log::info!("show_chat_input called");
     CHAT_STATE.store(1, Ordering::SeqCst); // InputOpen
 
-    // Enable mouse events on panel
-    {
-        eprintln!("[DEBUG] Acquiring OVERLAY_PANEL lock in show_chat_input");
-        let panel_guard = OVERLAY_PANEL.lock().unwrap();
-        eprintln!("[DEBUG] Got OVERLAY_PANEL lock");
-        if let Some(ref panel) = *panel_guard {
-            unsafe {
-                let _: () = msg_send![panel.0, setIgnoresMouseEvents: NO];
-                eprintln!("[DEBUG] Panel mouse events enabled");
-                log::info!("Panel mouse events enabled");
+    unsafe {
+        // Check if chat panel exists, create if not
+        let mut panel_exists = false;
+        {
+            let guard = CHAT_PANEL.lock().unwrap();
+            panel_exists = guard.is_some();
+        }
+
+        if !panel_exists {
+            // Create a new centered panel for chat
+            let screen: id = msg_send![Class::get("NSScreen").unwrap(), mainScreen];
+            let screen_frame: NSRect = msg_send![screen, frame];
+
+            let chat_width = 400.0;
+            let chat_height = 56.0;
+            let chat_x = (screen_frame.size.width - chat_width) / 2.0;
+            let chat_y = (screen_frame.size.height - chat_height) / 2.0;
+
+            let panel_frame = NSRect::new(
+                NSPoint::new(chat_x, chat_y),
+                NSSize::new(chat_width, chat_height),
+            );
+
+            // Create custom panel class for keyboard input
+            let panel_class = get_or_create_key_panel_class();
+            let chat_panel: id = msg_send![panel_class, alloc];
+
+            // NSBorderlessWindowMask | NSNonactivatingPanelMask
+            let style_mask: u64 = 0 | (1 << 7);
+            let chat_panel: id = msg_send![chat_panel, initWithContentRect:panel_frame
+                styleMask:style_mask
+                backing:2_i64 // NSBackingStoreBuffered
+                defer:NO];
+
+            // Make panel float above everything
+            let _: () = msg_send![chat_panel, setLevel: KCGMAXIMUM_WINDOW_LEVEL];
+            let _: () = msg_send![chat_panel, setOpaque: NO];
+            let clear: id = msg_send![Class::get("NSColor").unwrap(), clearColor];
+            let _: () = msg_send![chat_panel, setBackgroundColor: clear];
+            let _: () = msg_send![chat_panel, setHasShadow: NO];
+            let _: () = msg_send![chat_panel, setCollectionBehavior: 1_u64 | 16_u64];
+
+            // Get content view
+            let content_view: id = msg_send![chat_panel, contentView];
+            let _: () = msg_send![content_view, setWantsLayer: YES];
+
+            // Create sleek chat container
+            let container_frame = NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(chat_width, chat_height),
+            );
+
+            let chat_container: id = msg_send![Class::get("NSView").unwrap(), alloc];
+            let chat_container: id = msg_send![chat_container, initWithFrame: container_frame];
+            let _: () = msg_send![chat_container, setWantsLayer: YES];
+
+            // Style: WHITE background, sleek pill shape
+            let chat_layer: id = msg_send![chat_container, layer];
+            let _: () = msg_send![chat_layer, setCornerRadius: 28.0_f64];
+            let _: () = msg_send![chat_layer, setMasksToBounds: NO];
+
+            let white: id = msg_send![Class::get("NSColor").unwrap(), whiteColor];
+            let cg_white: id = msg_send![white, CGColor];
+            let _: () = msg_send![chat_layer, setBackgroundColor: cg_white];
+
+            // Subtle border
+            let border_color = create_color(230.0, 230.0, 230.0, 1.0);
+            let cg_border: id = msg_send![border_color, CGColor];
+            let _: () = msg_send![chat_layer, setBorderColor: cg_border];
+            let _: () = msg_send![chat_layer, setBorderWidth: 1.0_f64];
+
+            // Elegant shadow
+            let _: () = msg_send![chat_layer, setShadowOpacity: 0.2_f32];
+            let _: () = msg_send![chat_layer, setShadowRadius: 25.0_f64];
+            let _: () = msg_send![chat_layer, setShadowOffset: NSSize::new(0.0, -8.0)];
+            let black: id = msg_send![Class::get("NSColor").unwrap(), blackColor];
+            let cg_black: id = msg_send![black, CGColor];
+            let _: () = msg_send![chat_layer, setShadowColor: cg_black];
+
+            // Create text input
+            let input_padding = 24.0;
+            let btn_space = 56.0;
+            let input_width = chat_width - input_padding * 2.0 - btn_space;
+            let input_height = 30.0;
+            let input_frame = NSRect::new(
+                NSPoint::new(input_padding, (chat_height - input_height) / 2.0),
+                NSSize::new(input_width, input_height),
+            );
+
+            let chat_input: id = msg_send![Class::get("NSTextField").unwrap(), alloc];
+            let chat_input: id = msg_send![chat_input, initWithFrame: input_frame];
+            let _: () = msg_send![chat_input, setEditable: YES];
+            let _: () = msg_send![chat_input, setSelectable: YES];
+            let _: () = msg_send![chat_input, setBordered: NO];
+            let _: () = msg_send![chat_input, setDrawsBackground: NO];
+            let _: () = msg_send![chat_input, setWantsLayer: YES];
+            let _: () = msg_send![chat_input, setFocusRingType: 0_i64];
+
+            // Black text
+            let black_text: id = msg_send![Class::get("NSColor").unwrap(), blackColor];
+            let _: () = msg_send![chat_input, setTextColor: black_text];
+
+            // Modern system font
+            let input_font: id = msg_send![Class::get("NSFont").unwrap(), systemFontOfSize: 16.0_f64 weight: 0.0_f64];
+            let _: () = msg_send![chat_input, setFont: input_font];
+
+            // Gray placeholder
+            let placeholder_str = NSString::alloc(nil).init_str("Ask me anything...");
+            let placeholder_color = create_color(160.0, 160.0, 160.0, 1.0);
+            let fg_key = NSString::alloc(nil).init_str("NSColor");
+            let font_key = NSString::alloc(nil).init_str("NSFont");
+            let keys: [id; 2] = [fg_key, font_key];
+            let objects: [id; 2] = [placeholder_color, input_font];
+            let placeholder_dict: id = msg_send![Class::get("NSDictionary").unwrap(),
+                dictionaryWithObjects: objects.as_ptr()
+                forKeys: keys.as_ptr()
+                count: 2_usize
+            ];
+            let attr_placeholder: id = msg_send![Class::get("NSAttributedString").unwrap(), alloc];
+            let attr_placeholder: id = msg_send![attr_placeholder, initWithString:placeholder_str attributes:placeholder_dict];
+            let _: () = msg_send![chat_input, setPlaceholderAttributedString: attr_placeholder];
+
+            let _: () = msg_send![chat_container, addSubview: chat_input];
+
+            // Create send button
+            let btn_size = 40.0;
+            let btn_frame = NSRect::new(
+                NSPoint::new(chat_width - btn_size - 8.0, (chat_height - btn_size) / 2.0),
+                NSSize::new(btn_size, btn_size),
+            );
+
+            let send_btn: id = msg_send![Class::get("NSButton").unwrap(), alloc];
+            let send_btn: id = msg_send![send_btn, initWithFrame: btn_frame];
+            let _: () = msg_send![send_btn, setWantsLayer: YES];
+            let _: () = msg_send![send_btn, setBordered: NO];
+
+            // Black circular button
+            let btn_layer: id = msg_send![send_btn, layer];
+            let _: () = msg_send![btn_layer, setCornerRadius: 20.0_f64];
+            let cg_black_bg: id = msg_send![black, CGColor];
+            let _: () = msg_send![btn_layer, setBackgroundColor: cg_black_bg];
+
+            // White arrow on button
+            let btn_title = NSString::alloc(nil).init_str("↑");
+            let btn_font: id = msg_send![Class::get("NSFont").unwrap(), boldSystemFontOfSize: 18.0_f64];
+            let white_text: id = msg_send![Class::get("NSColor").unwrap(), whiteColor];
+            let btn_keys: [id; 2] = [fg_key, font_key];
+            let btn_objects: [id; 2] = [white_text, btn_font];
+            let btn_dict: id = msg_send![Class::get("NSDictionary").unwrap(),
+                dictionaryWithObjects: btn_objects.as_ptr()
+                forKeys: btn_keys.as_ptr()
+                count: 2_usize
+            ];
+            let btn_attr: id = msg_send![Class::get("NSAttributedString").unwrap(), alloc];
+            let btn_attr: id = msg_send![btn_attr, initWithString:btn_title attributes:btn_dict];
+            let _: () = msg_send![send_btn, setAttributedTitle: btn_attr];
+
+            let _: () = msg_send![chat_container, addSubview: send_btn];
+            let _: () = msg_send![content_view, addSubview: chat_container];
+
+            // Store references
+            {
+                let mut guard = CHAT_PANEL.lock().unwrap();
+                *guard = Some(SafeId(chat_panel));
+            }
+            {
+                let mut guard = CHAT_CONTAINER.lock().unwrap();
+                *guard = Some(SafeId(chat_container));
+            }
+            {
+                let mut guard = CHAT_INPUT.lock().unwrap();
+                *guard = Some(SafeId(chat_input));
+            }
+            {
+                let mut guard = SEND_BUTTON.lock().unwrap();
+                *guard = Some(SafeId(send_btn));
             }
         }
-        eprintln!("[DEBUG] Releasing OVERLAY_PANEL lock");
-    }
 
-    eprintln!("[DEBUG] Acquiring CHAT_CONTAINER lock");
-    let guard = CHAT_CONTAINER.lock().unwrap();
-    eprintln!("[DEBUG] Got CHAT_CONTAINER lock");
-    if let Some(ref container) = *guard {
-        eprintln!("[DEBUG] Found chat container, showing it");
-        log::info!("Found chat container, showing it");
-        unsafe {
-            let _: () = msg_send![container.0, setHidden: NO];
-            let _: () = msg_send![container.0, setAlphaValue: 1.0_f64];
+        // Show the chat panel - get raw pointer first to avoid holding lock
+        let (panel_ptr, input_ptr) = {
+            let guard = CHAT_PANEL.lock().unwrap();
+            let input_guard = CHAT_INPUT.lock().unwrap();
+            let panel = guard.as_ref().map(|p| p.0);
+            let input = input_guard.as_ref().map(|i| i.0);
+            (panel, input)
+        };
 
-            // Force redisplay
-            let _: () = msg_send![container.0, setNeedsDisplay: YES];
-            eprintln!("[DEBUG] Chat container shown and alpha set to 1.0");
-            log::info!("Chat container shown and alpha set to 1.0");
-        }
-    } else {
-        eprintln!("[DEBUG] No chat container found!");
-        log::warn!("No chat container found!");
-    }
-    drop(guard);
-    eprintln!("[DEBUG] Released CHAT_CONTAINER lock");
+        if let Some(panel) = panel_ptr {
+            eprintln!("[DEBUG] Showing chat panel...");
+            log::info!("Showing chat panel at center of screen");
 
-    // Focus the input field and make window key (with small delay for animation)
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        eprintln!("[DEBUG] Thread woke up, focusing input");
-        unsafe {
-            // Activate the app first
+            // Get panel frame for debugging
+            let frame: NSRect = msg_send![panel, frame];
+            eprintln!("[DEBUG] Chat panel frame: x={}, y={}, w={}, h={}",
+                frame.origin.x, frame.origin.y, frame.size.width, frame.size.height);
+            log::info!("Chat panel frame: x={}, y={}, w={}, h={}",
+                frame.origin.x, frame.origin.y, frame.size.width, frame.size.height);
+
+            // Ensure panel is visible
+            let _: () = msg_send![panel, setAlphaValue: 1.0_f64];
+            let _: () = msg_send![panel, setIsVisible: YES];
+            let _: () = msg_send![panel, orderFrontRegardless];
+
+            // Make key window and focus input
             let app: id = msg_send![Class::get("NSApplication").unwrap(), sharedApplication];
             let _: () = msg_send![app, activateIgnoringOtherApps: YES];
-            eprintln!("[DEBUG] App activated");
+            let _: () = msg_send![panel, makeKeyAndOrderFront: nil];
 
-            eprintln!("[DEBUG] Acquiring OVERLAY_PANEL lock in thread");
-            let panel_guard = OVERLAY_PANEL.lock().unwrap();
-            eprintln!("[DEBUG] Got OVERLAY_PANEL lock in thread");
-            if let Some(ref panel) = *panel_guard {
-                // Make the panel key window to receive keyboard input
-                let _: () = msg_send![panel.0, makeKeyAndOrderFront: nil];
-                eprintln!("[DEBUG] Panel made key window");
-                log::info!("Panel made key window");
-
-                let input_guard = CHAT_INPUT.lock().unwrap();
-                if let Some(ref input) = *input_guard {
-                    // Select all existing text and focus
-                    let _: () = msg_send![input.0, selectText: nil];
-                    let result: bool = msg_send![panel.0, makeFirstResponder: input.0];
-                    eprintln!("[DEBUG] Made input first responder: {}", result);
-                    log::info!("Made input first responder: {}", result);
-                }
+            if let Some(input) = input_ptr {
+                let _: () = msg_send![input, selectText: nil];
+                let _: () = msg_send![panel, makeFirstResponder: input];
             }
+            eprintln!("[DEBUG] Chat panel shown and focused");
+            log::info!("Chat panel shown and focused");
+        } else {
+            eprintln!("[DEBUG] ERROR: Chat panel is None!");
+            log::info!("ERROR: Chat panel is None!");
         }
-        eprintln!("[DEBUG] Thread complete");
-    });
-    eprintln!("[DEBUG] show_chat_input returning");
+    }
+    eprintln!("[DEBUG] show_chat_input complete");
+    log::info!("show_chat_input complete");
 }
 
 /// Hide chat input box with fade out
@@ -1286,37 +1716,14 @@ pub fn show_chat_input() {
 pub fn hide_chat_input() {
     CHAT_STATE.store(0, Ordering::SeqCst); // Idle
 
-    // Disable mouse events on panel (pass through)
-    {
-        let panel_guard = OVERLAY_PANEL.lock().unwrap();
-        if let Some(ref panel) = *panel_guard {
-            unsafe {
-                let _: () = msg_send![panel.0, setIgnoresMouseEvents: YES];
-            }
+    unsafe {
+        let guard = CHAT_PANEL.lock().unwrap();
+        if let Some(ref panel) = *guard {
+            // Simply hide immediately without animation to avoid thread issues
+            let _: () = msg_send![panel.0, setAlphaValue: 0.0_f64];
+            let _: () = msg_send![panel.0, orderOut: nil];
         }
     }
-
-    let guard = CHAT_CONTAINER.lock().unwrap();
-    if let Some(ref container) = *guard {
-        unsafe {
-            // Animate fade out
-            let animator: id = msg_send![container.0, animator];
-            let _: () = msg_send![animator, setAlphaValue: 0.0_f64];
-        }
-    }
-
-    // Hide after animation
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let guard = CHAT_CONTAINER.lock().unwrap();
-        if let Some(ref container) = *guard {
-            if CHAT_STATE.load(Ordering::SeqCst) == 0 {
-                unsafe {
-                    let _: () = msg_send![container.0, setHidden: YES];
-                }
-            }
-        }
-    });
 }
 
 /// Show thinking indicator
@@ -1325,41 +1732,23 @@ pub fn hide_chat_input() {
 pub fn show_thinking() {
     CHAT_STATE.store(2, Ordering::SeqCst); // Thinking
 
-    // Hide chat input
-    {
-        let guard = CHAT_CONTAINER.lock().unwrap();
-        if let Some(ref container) = *guard {
-            unsafe {
-                let animator: id = msg_send![container.0, animator];
-                let _: () = msg_send![animator, setAlphaValue: 0.0_f64];
-            }
+    unsafe {
+        // Hide the chat panel immediately
+        let guard = CHAT_PANEL.lock().unwrap();
+        if let Some(ref panel) = *guard {
+            let _: () = msg_send![panel.0, setAlphaValue: 0.0_f64];
+            let _: () = msg_send![panel.0, orderOut: nil];
         }
     }
 
-    // Show thinking label
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-
-        // Hide container
-        {
-            let guard = CHAT_CONTAINER.lock().unwrap();
-            if let Some(ref container) = *guard {
-                unsafe {
-                    let _: () = msg_send![container.0, setHidden: YES];
-                }
-            }
-        }
-
-        // Show thinking
+    // Show thinking label immediately
+    unsafe {
         let guard = THINKING_LABEL.lock().unwrap();
         if let Some(ref label) = *guard {
-            unsafe {
-                let _: () = msg_send![label.0, setHidden: NO];
-                let animator: id = msg_send![label.0, animator];
-                let _: () = msg_send![animator, setAlphaValue: 1.0_f64];
-            }
+            let _: () = msg_send![label.0, setHidden: NO];
+            let _: () = msg_send![label.0, setAlphaValue: 1.0_f64];
         }
-    });
+    }
 }
 
 /// Hide thinking indicator
@@ -1369,20 +1758,10 @@ pub fn hide_thinking() {
     let guard = THINKING_LABEL.lock().unwrap();
     if let Some(ref label) = *guard {
         unsafe {
-            let animator: id = msg_send![label.0, animator];
-            let _: () = msg_send![animator, setAlphaValue: 0.0_f64];
+            let _: () = msg_send![label.0, setAlphaValue: 0.0_f64];
+            let _: () = msg_send![label.0, setHidden: YES];
         }
     }
-
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let guard = THINKING_LABEL.lock().unwrap();
-        if let Some(ref label) = *guard {
-            unsafe {
-                let _: () = msg_send![label.0, setHidden: YES];
-            }
-        }
-    });
 }
 
 /// Show response box with typing effect
@@ -1394,34 +1773,23 @@ pub fn show_response_with_typing(text: String) {
     // Store the response text
     {
         let mut guard = CURRENT_RESPONSE.lock().unwrap();
-        *guard = text;
+        *guard = text.clone();
     }
     RESPONSE_CHAR_INDEX.store(0, Ordering::SeqCst);
 
     // Hide thinking
     hide_thinking();
 
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(350));
-
-        // Show response box
-        {
-            let guard = RESPONSE_BOX.lock().unwrap();
-            if let Some(ref box_) = *guard {
-                unsafe {
-                    let _: () = msg_send![box_.0, setStringValue: NSString::alloc(nil).init_str("")];
-                    let _: () = msg_send![box_.0, setHidden: NO];
-                    let animator: id = msg_send![box_.0, animator];
-                    let _: () = msg_send![animator, setAlphaValue: 1.0_f64];
-                }
-            }
+    // Show response box immediately with full text (no typing animation for now)
+    unsafe {
+        let guard = RESPONSE_BOX.lock().unwrap();
+        if let Some(ref box_) = *guard {
+            let ns_str = NSString::alloc(nil).init_str(&text);
+            let _: () = msg_send![box_.0, setStringValue: ns_str];
+            let _: () = msg_send![box_.0, setHidden: NO];
+            let _: () = msg_send![box_.0, setAlphaValue: 1.0_f64];
         }
-
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        // Start typing effect
-        start_typing_effect();
-    });
+    }
 }
 
 /// Start typing effect for response
@@ -1476,40 +1844,28 @@ fn start_typing_effect() {
 pub fn hide_response() {
     TYPING_RUNNING.store(false, Ordering::SeqCst);
 
-    let guard = RESPONSE_BOX.lock().unwrap();
-    if let Some(ref box_) = *guard {
-        unsafe {
-            let animator: id = msg_send![box_.0, animator];
-            let _: () = msg_send![animator, setAlphaValue: 0.0_f64];
+    // Hide response box immediately
+    {
+        let guard = RESPONSE_BOX.lock().unwrap();
+        if let Some(ref box_) = *guard {
+            unsafe {
+                let _: () = msg_send![box_.0, setAlphaValue: 0.0_f64];
+                let _: () = msg_send![box_.0, setHidden: YES];
+            }
         }
     }
-    drop(guard);
 
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-
-        // Hide response box
-        {
-            let guard = RESPONSE_BOX.lock().unwrap();
-            if let Some(ref box_) = *guard {
-                unsafe {
-                    let _: () = msg_send![box_.0, setHidden: YES];
-                }
+    // Disable mouse events on panel (pass through)
+    {
+        let panel_guard = OVERLAY_PANEL.lock().unwrap();
+        if let Some(ref panel) = *panel_guard {
+            unsafe {
+                let _: () = msg_send![panel.0, setIgnoresMouseEvents: YES];
             }
         }
+    }
 
-        // Disable mouse events on panel (pass through)
-        {
-            let panel_guard = OVERLAY_PANEL.lock().unwrap();
-            if let Some(ref panel) = *panel_guard {
-                unsafe {
-                    let _: () = msg_send![panel.0, setIgnoresMouseEvents: YES];
-                }
-            }
-        }
-
-        CHAT_STATE.store(0, Ordering::SeqCst); // Back to idle
-    });
+    CHAT_STATE.store(0, Ordering::SeqCst); // Back to idle
 }
 
 /// Send message to Groq API
